@@ -1,0 +1,165 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Nov 30 11:01:03 2018
+
+@author: 5002929
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import os
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+%matplotlib inline
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import accuracy_score
+from sklearn import model_selection
+from sklearn.metrics import classification_report
+from IPython.display import display
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_curve
+import graphviz
+from sklearn import tree
+
+df = pd.read_csv(r'\\nlaisr001.intleurope.imptobnet.com\homeshares$\5002929\Desktop\Fontem2.csv', encoding='iso-8859-1')
+
+#Rule based row filter
+df['mineffectivedatemyblu'] = pd.to_datetime(df['mineffectivedatemyblu'])
+df['EffectiveDate'] = pd.to_datetime(df['EffectiveDate'])
+df=df[(df['type of myblu consumer']=="new myblu consumer") & (df['DW_Site_Country__c']=="US") & (df['mineffectivedatemyblu'] < '2018/10/14')]
+
+#Rank
+df.sort_values(['accountId','OrderNumber'],ascending=True).groupby('accountId')
+df['rankordernumber']=df.groupby("accountId")["OrderNumber"].rank(method="dense", ascending=True)
+
+#Date & Time shift
+df['mineffectivedatemybluoutcome date']=pd.to_datetime(df['mineffectivedatemyblu']) + pd.DateOffset(weeks=5)
+
+#Rule-based row Filter
+df=df[df['EffectiveDate']<=df['mineffectivedatemybluoutcome date']]
+
+#Drop some columns
+columns = ['Customer_Group__c', 'Purchase_Channel_myblu__c', 'CreatedDate', 'maxeffectivedatemyblu']
+df.drop(columns, inplace=True, axis=1)
+
+#Pivoting
+df2=df.groupby(['accountId', 'OrderNumber', 'Gender__c', 'age_myblu', 'Opt_In__c']).min()
+df2=df2.reset_index()
+
+vals=['EffectiveDate', 'Order_Gross_Amount__c',  'Price_adjustments__c']
+Pivot_data=df2.pivot(index='accountId', columns='rankordernumber', values=vals)
+Pivot_data=Pivot_data.reset_index()
+
+Categories=df[['accountId','Gender__c', 'age_myblu', 'Opt_In__c', 'rankordernumber']].groupby(['accountId']).max()
+
+merged = pd.merge(Pivot_data,Categories, on=['accountId','accountId'])
+
+#Rule Engine
+merged['churn'] = np.where(merged['rankordernumber']>1, 'Conversion', 'No Conversion')
+
+#Column filter
+finaldata=merged[[('Price_adjustments__c', 1.0),'Gender__c', 'age_myblu', 'Opt_In__c', 'churn']]
+
+#Also change some of the datatypes
+finaldata[('Price_adjustments__c', 1.0)] = finaldata[('Price_adjustments__c', 1.0)].astype(float)
+finaldata['Opt_In__c'] = finaldata['Opt_In__c'].astype(object)
+
+
+df_number=finaldata.select_dtypes(exclude=["object"])
+df_object=finaldata.select_dtypes(exclude=["number"])
+
+#Get dummies
+df_object = pd.get_dummies(df_object,drop_first=True)
+df_object = df_object.rename(columns={'churn_No Conversion': 'Conversion'})
+finaldata=pd.concat([df_number,df_object],axis=1)  # Concatenate bins with object variables
+
+#Plot and remove missing data rows
+fig, ax = plt.subplots(figsize=(20,20))       
+sns.heatmap(finaldata.isnull(),yticklabels=False,cbar=False,cmap='viridis') #Missing data plot
+
+finaldata=finaldata.dropna()
+
+
+#Partitioning
+X_train, X_test, y_train, y_test = train_test_split(finaldata.drop('Conversion',axis=1), finaldata['Conversion'], test_size=0.30, random_state=101)
+
+#Heatmap
+fig, ax = plt.subplots(figsize=(10,10))         # Sample figsize in inches
+corr = X_train.corr()
+sns.heatmap(corr, 
+            xticklabels=corr.columns.values,
+            yticklabels=corr.columns.values)
+
+corr = X_train.corr()
+corr.style.background_gradient()
+
+#Test different models with cross validation
+seed=101
+scoring = 'accuracy'
+models = []
+models.append(('LR', LogisticRegression()))
+models.append(('KNN', KNeighborsClassifier()))
+models.append(('CART', DecisionTreeClassifier()))
+models.append(('NB', GaussianNB()))
+models.append(('RF', RandomForestClassifier()))
+results = []
+names = []
+for name, model in models:
+   kfold = model_selection.KFold(n_splits=30, random_state=seed)
+   cv_results = model_selection.cross_val_score(model, X_train, y_train, cv=kfold, scoring=scoring)
+   results.append(cv_results)
+   names.append(name)
+   msg = "%s: %f (%f)" % (name, cv_results.mean(), cv_results.std())
+   print(msg)
+
+
+#Fitting decision tree with gridsearch
+param_grid = { 
+    'max_features': ['auto', 'sqrt', 'log2'],
+    'max_depth' : [4,6,10,20],
+    'criterion' :['gini', 'entropy']
+}
+
+dtree = tree.DecisionTreeClassifier(max_depth=4, criterion='entropy', random_state = 100)
+
+stratisfied = StratifiedShuffleSplit(n_splits=20, test_size=0.5, random_state=0)
+CV_rfc = GridSearchCV(estimator=dtree, param_grid=param_grid, cv=stratisfied,verbose=3) #Using stratisfied
+CV_rfc.fit(X_train, y_train)
+CV_rfc.best_params_
+
+CV_rfc_pred = CV_rfc.predict(X_test)
+print(classification_report(y_test,CV_rfc_pred))
+
+
+#Plot the decision tree
+dot_data = tree.export_graphviz(CV_rfc.best_estimator_, out_file=None, feature_names=list(X_train)) 
+graph = graphviz.Source(dot_data) 
+graph
+
+
+#Plot roc curve
+logit_roc_auc = roc_auc_score(y_test, CV_rfc.predict(X_test))
+fpr, tpr, thresholds = roc_curve(y_test, CV_rfc.predict_proba(X_test)[:,1])
+plt.figure()
+plt.plot(fpr, tpr, label='Decision tree (area = %0.2f)' % logit_roc_auc)
+plt.plot([0, 1], [0, 1],'r--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver operating characteristic')
+plt.legend(loc="lower right")
+plt.savefig('Log_ROC')
+plt.show()
+
